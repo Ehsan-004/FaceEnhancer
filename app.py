@@ -1,0 +1,484 @@
+# Face Super-Resolution GUI
+# PySide6 app with Material-like styling, drag & drop input, async inference, and save output
+# ---------------------------------------------------------
+# Requirements (install with pip):
+#   pip install PySide6 Pillow torch torchvision qt-material piq
+# (qt-material is optional; app falls back to custom stylesheet if missing)
+# ---------------------------------------------------------
+
+import sys
+import os
+from pathlib import Path
+from typing import Optional, Tuple
+
+from PIL import Image
+import numpy as np
+
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import Qt
+
+# Torch imports
+import torch
+import torch.nn as nn
+import torchvision.transforms as T
+
+
+# ============================
+# Model definition (FaceUNet)
+# ============================
+class FaceUNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.down1 = nn.Sequential(
+            nn.Conv2d(3, 64, 3, padding=1, stride=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, padding=1, stride=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+        )
+        self.down3 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, padding=1, stride=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+        )
+
+        self.up3 = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.conv3 = nn.Conv2d(256, 128, 3, padding=1, stride=1)
+
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.conv2 = nn.Conv2d(128, 64, 3, padding=1, stride=1)
+
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(64, 3, 4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(6, 3, 3, padding=1, stride=1),
+            nn.Sigmoid(),  # assuming inputs in [0,1]
+        )
+
+    def forward(self, x):
+        id0 = x
+        x = self.down1(x)
+        id1 = x
+        x = self.down2(x)
+        id2 = x
+        x = self.down3(x)
+
+        x = self.up3(x)
+        x = torch.cat([x, id2], dim=1)
+        x = self.conv3(x)
+
+        x = self.up2(x)
+        x = torch.cat([x, id1], dim=1)
+        x = self.conv2(x)
+
+        x = self.up1(x)
+        x = torch.cat([x, id0], dim=1)
+        x = self.conv1(x)
+        return x
+
+
+# ============================
+# Utilities
+# ============================
+
+def pad_to_multiple(img: torch.Tensor, multiple: int = 8) -> Tuple[torch.Tensor, Tuple[int, int, int, int]]:
+    """Pad BCHW tensor to be divisible by multiple (for pooling/upsampling). Returns padded tensor and pads."""
+    _, _, h, w = img.shape
+    pad_h = (multiple - h % multiple) % multiple
+    pad_w = (multiple - w % multiple) % multiple
+    # Pad as (left, right, top, bottom)
+    pad = (0, pad_w, 0, pad_h)
+    if pad_h or pad_w:
+        img = torch.nn.functional.pad(img, pad, mode="reflect")
+    return img, pad
+
+
+def unpad_tensor(img: torch.Tensor, pad: Tuple[int, int, int, int]) -> torch.Tensor:
+    l, r, t, b = pad
+    _, _, h, w = img.shape
+    return img[..., t:h - b if b > 0 else h, l:w - r if r > 0 else w]
+
+
+def pil_to_qpixmap(pil_img: Image.Image) -> QtGui.QPixmap:
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    data = pil_img.tobytes("raw", "RGB")
+    qimg = QtGui.QImage(data, pil_img.width, pil_img.height, QtGui.QImage.Format.Format_RGB888)
+    return QtGui.QPixmap.fromImage(qimg)
+
+
+def qpixmap_to_display(pix: QtGui.QPixmap, max_w: int, max_h: int) -> QtGui.QPixmap:
+    return pix.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+
+# ============================
+# Worker for async inference
+# ============================
+class InferenceSignals(QtCore.QObject):
+    started = QtCore.Signal()
+    finished = QtCore.Signal(Image.Image)  # PIL image
+    error = QtCore.Signal(str)
+
+
+class InferenceWorker(QtCore.QRunnable):
+    def __init__(self, model: nn.Module, device: torch.device, image_path: Path):
+        super().__init__()
+        self.model = model
+        self.device = device
+        self.image_path = image_path
+        self.signals = InferenceSignals()
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            self.signals.started.emit()
+            # Load image
+            img = Image.open(self.image_path).convert("RGB")
+            # To tensor [0,1]
+            to_tensor = T.ToTensor()
+            x = to_tensor(img).unsqueeze(0).to(self.device)
+            # Pad to multiple of 8
+            x_pad, pad = pad_to_multiple(x, multiple=8)
+            with torch.no_grad():
+                self.model.eval()
+                y = self.model(x_pad)
+            # Unpad and clamp
+            y = unpad_tensor(y, pad)
+            y = torch.clamp(y, 0.0, 1.0)
+            # To PIL
+            to_pil = T.ToPILImage()
+            out_pil = to_pil(y.squeeze(0).cpu())
+            self.signals.finished.emit(out_pil)
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+
+# ============================
+# Drag & Drop widget (left card)
+# ============================
+class DropImageCard(QtWidgets.QFrame):
+    file_dropped = QtCore.Signal(Path)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setObjectName("DropCard")
+        self.setCursor(Qt.PointingHandCursor)
+
+        self.layout = QtWidgets.QVBoxLayout(self)
+        self.layout.setContentsMargins(24, 24, 24, 24)
+        self.layout.setSpacing(12)
+
+        self.icon = QtWidgets.QLabel()
+        self.icon.setAlignment(Qt.AlignCenter)
+        self.icon.setPixmap(QtGui.QPixmap(64, 64))
+        self.icon.setText("")
+
+        self.title = QtWidgets.QLabel("تصویر را اینجا بکشید یا کلیک کنید")
+        self.title.setAlignment(Qt.AlignCenter)
+        self.title.setObjectName("CardTitle")
+
+        self.preview = QtWidgets.QLabel()
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setObjectName("Preview")
+        self.preview.setMinimumHeight(240)
+        self.preview.setScaledContents(False)
+
+        self.layout.addWidget(self.title)
+        self.layout.addWidget(self.preview, 1)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            dlg = QtWidgets.QFileDialog(self, "انتخاب تصویر")
+            dlg.setNameFilters(["Images (*.png *.jpg *.jpeg *.bmp)"])
+            if dlg.exec():
+                paths = dlg.selectedFiles()
+                if paths:
+                    self._set_preview(Path(paths[0]))
+                    self.file_dropped.emit(Path(paths[0]))
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        for url in event.mimeData().urls():
+            p = Path(url.toLocalFile())
+            if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}:
+                self._set_preview(p)
+                self.file_dropped.emit(p)
+                break
+
+    def _set_preview(self, path: Path):
+        pix = QtGui.QPixmap(str(path))
+        pix = qpixmap_to_display(pix, 600, 500)
+        self.preview.setPixmap(pix)
+
+
+# ============================
+# Right card: output / status
+# ============================
+class OutputCard(QtWidgets.QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("OutputCard")
+
+        self.layout = QtWidgets.QVBoxLayout(self)
+        self.layout.setContentsMargins(24, 24, 24, 24)
+        self.layout.setSpacing(12)
+
+        self.title = QtWidgets.QLabel("خروجی")
+        self.title.setObjectName("CardTitle")
+        self.title.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        self.stack = QtWidgets.QStackedWidget()
+
+        # Page 0: Placeholder
+        placeholder = QtWidgets.QLabel("اینجا خروجی نمایش داده می‌شود")
+        placeholder.setAlignment(Qt.AlignCenter)
+        self.stack.addWidget(placeholder)
+
+        # Page 1: Processing
+        proc_widget = QtWidgets.QWidget()
+        proc_layout = QtWidgets.QVBoxLayout(proc_widget)
+        proc_label = QtWidgets.QLabel("در حال پردازش...")
+        proc_label.setAlignment(Qt.AlignCenter)
+        spinner = QtWidgets.QProgressBar()
+        spinner.setRange(0, 0)  # Busy
+        spinner.setTextVisible(False)
+        proc_layout.addStretch(1)
+        proc_layout.addWidget(proc_label)
+        proc_layout.addWidget(spinner)
+        proc_layout.addStretch(1)
+        self.stack.addWidget(proc_widget)
+
+        # Page 2: Image
+        img_label = QtWidgets.QLabel()
+        img_label.setAlignment(Qt.AlignCenter)
+        img_label.setObjectName("OutputPreview")
+        self.stack.addWidget(img_label)
+
+        self.layout.addWidget(self.title)
+        self.layout.addWidget(self.stack, 1)
+
+    def show_placeholder(self):
+        self.stack.setCurrentIndex(0)
+
+    def show_processing(self):
+        self.stack.setCurrentIndex(1)
+
+    def show_image(self, pil_img: Image.Image):
+        pix = pil_to_qpixmap(pil_img)
+        pix = qpixmap_to_display(pix, 600, 500)
+        lbl: QtWidgets.QLabel = self.stack.widget(2)  # type: ignore
+        lbl.setPixmap(pix)
+        self.stack.setCurrentIndex(2)
+
+
+# ============================
+# Main Window
+# ============================
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self, model_path: Optional[Path] = None):
+        super().__init__()
+        self.setWindowTitle("Face Super-Resolution | PySide6")
+        self.resize(1200, 720)
+
+        # Central widget
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+
+        root = QtWidgets.QVBoxLayout(central)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(16)
+
+        # Top area: two cards
+        cards = QtWidgets.QHBoxLayout()
+        cards.setSpacing(16)
+        root.addLayout(cards, 1)
+
+        self.drop_card = DropImageCard()
+        self.output_card = OutputCard()
+        cards.addWidget(self.drop_card, 1)
+        cards.addWidget(self.output_card, 1)
+
+        # Bottom bar: Save button
+        bottom_bar = QtWidgets.QHBoxLayout()
+        root.addLayout(bottom_bar)
+        bottom_bar.addStretch(1)
+        self.btn_save = QtWidgets.QPushButton("💾 ذخیره خروجی")
+        self.btn_save.setEnabled(False)
+        self.btn_save.clicked.connect(self.save_output)
+        bottom_bar.addWidget(self.btn_save)
+
+        # Menu -> Load model
+        act_load_model = QtGui.QAction("بارگذاری مدل", self)
+        act_load_model.triggered.connect(self.choose_model_path)
+        menu = self.menuBar().addMenu("مدل")
+        menu.addAction(act_load_model)
+
+        # State
+        self.thread_pool = QtCore.QThreadPool.globalInstance()
+        self.model: Optional[nn.Module] = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.last_output: Optional[Image.Image] = None
+        self.current_input_path: Optional[Path] = None
+
+        # Signals
+        self.drop_card.file_dropped.connect(self.on_image_selected)
+
+        # Load model if provided
+        if model_path is not None and model_path.exists():
+            self.load_model(model_path)
+        else:
+            # Ask user to load model on start
+            QtCore.QTimer.singleShot(200, self.choose_model_path)
+
+    # ===== Styling =====
+    def set_dark_material_palette(self):
+        try:
+            from qt_material import apply_stylesheet
+            apply_stylesheet(self, theme='dark_blue.xml')
+        except Exception:
+            # Fallback basic stylesheet (Material-ish)
+            self.setStyleSheet(
+                """
+                QMainWindow { background-color: #1e2a38; }
+                QMenuBar { background-color: #1e2a38; color: #e6eef7; }
+                QMenuBar::item { background: transparent; padding: 6px 12px; }
+                QMenu { background-color: #223142; color: #e6eef7; }
+                QFrame#DropCard, QFrame#OutputCard {
+                    background-color: #243447; border-radius: 16px; border: 1px solid #2f4a64;
+                }
+                QLabel#CardTitle { color: #e6eef7; font-size: 16px; font-weight: 600; }
+                QLabel { color: #d9e3ee; }
+                QPushButton {
+                    background-color: #2f89fc; color: white; border: none; border-radius: 12px; padding: 10px 18px;
+                }
+                QPushButton:disabled { background-color: #3b4b61; color: #a4b1c3; }
+                QPushButton:hover { filter: brightness(1.1); }
+                QProgressBar { background-color: #1f2b3a; border: 1px solid #2f4a64; border-radius: 8px; }
+                QProgressBar::chunk { background-color: #2f89fc; }
+                """
+            )
+
+    # ===== Model loading =====
+    def choose_model_path(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "انتخاب فایل وزن‌های مدل (.pt / .pth)",
+            str(Path.home()),
+            "Torch Weights (*.pt *.pth)"
+        )
+        if path:
+            self.load_model(Path(path))
+
+    def load_model(self, path: Path):
+        try:
+            from model import FaceUNet  # چون مدل رو داری توی فایل
+            mdl = FaceUNet().to(self.device)
+
+            # فقط وزن‌ها رو لود کن
+            state = torch.load(str(path), map_location=self.device)
+            if isinstance(state, dict) and 'state_dict' in state:
+                mdl.load_state_dict(state['state_dict'])
+            elif isinstance(state, dict) and 'model' in state and isinstance(state['model'], dict):
+                mdl.load_state_dict(state['model'])
+            else:
+                mdl.load_state_dict(state)
+
+            self.model = mdl
+            self.statusBar().showMessage(
+                f"مدل لود شد: {path.name} | دستگاه: {self.device}", 5000
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "خطا در بارگذاری مدل", str(e))
+
+    # def choose_model_path(self):
+    #     from model import FaceUNet
+    #     path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "انتخاب فایل مدل (.pt / .pth)", str(Path.home()),
+    #                                                     "Torch Model (*.pt *.pth)")
+    #     if path:
+    #         self.load_model(Path(path))
+
+    # def load_model(self, path: Path):
+    #     try:
+    #         mdl = FaceUNet().to(self.device)
+    #         state = torch.load(str(path), map_location=self.device)
+    #         # Support for full checkpoints {'model': state_dict}
+    #         if isinstance(state, dict) and 'state_dict' in state:
+    #             mdl.load_state_dict(state['state_dict'])
+    #         elif isinstance(state, dict) and 'model' in state and isinstance(state['model'], dict):
+    #             mdl.load_state_dict(state['model'])
+    #         else:
+    #             mdl.load_state_dict(state)
+    #         self.model = mdl
+    #         self.statusBar().showMessage(f"مدل لود شد: {path.name} | دستگاه: {self.device}", 5000)
+    #     except Exception as e:
+    #         QtWidgets.QMessageBox.critical(self, "خطا در بارگذاری مدل", str(e))
+
+    # ===== Inference flow =====
+    def on_image_selected(self, path: Path):
+        self.current_input_path = path
+        if self.model is None:
+            QtWidgets.QMessageBox.warning(self, "مدل یافت نشد", "لطفاً ابتدا مدل را بارگذاری کنید.")
+            return
+        worker = InferenceWorker(self.model, self.device, path)
+        worker.signals.started.connect(self.on_inference_started)
+        worker.signals.finished.connect(self.on_inference_finished)
+        worker.signals.error.connect(self.on_inference_error)
+        self.thread_pool.start(worker)
+
+    def on_inference_started(self):
+        self.output_card.show_processing()
+        self.btn_save.setEnabled(False)
+        self.last_output = None
+
+    def on_inference_finished(self, pil_img: Image.Image):
+        self.last_output = pil_img
+        self.output_card.show_image(pil_img)
+        self.btn_save.setEnabled(True)
+
+    def on_inference_error(self, msg: str):
+        self.output_card.show_placeholder()
+        self.btn_save.setEnabled(False)
+        QtWidgets.QMessageBox.critical(self, "خطا در پردازش", msg)
+
+    # ===== Save =====
+    def save_output(self):
+        if self.last_output is None:
+            return
+        default_name = "output.png"
+        if self.current_input_path is not None:
+            default_name = f"{self.current_input_path.stem}_sr.png"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "ذخیره خروجی", default_name, "PNG Image (*.png)")
+        if path:
+            try:
+                self.last_output.save(path)
+                self.statusBar().showMessage("خروجی ذخیره شد.", 4000)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "خطا در ذخیره", str(e))
+
+
+# ============================
+# Entry point
+# ============================
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+
+    win = MainWindow()
+    win.set_dark_material_palette()
+    win.show()
+
+    sys.exit(app.exec())
