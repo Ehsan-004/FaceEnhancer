@@ -65,6 +65,8 @@ class FaceUNet(nn.Module):
         # after concatenating output of up 1 with output of down 2
         self.conv3 = nn.Conv2d(256, 128,  kernel_size=3, padding=1, stride=1)  # 128 channels
         
+        self.sigmoid = nn.Sigmoid()
+        
     
     def forward(self, x):
         identity0 = x  # c = 3
@@ -93,7 +95,7 @@ class FaceUNet(nn.Module):
         # ==--==--==--==-
         x = self.up1(x)
         x = torch.cat([x, identity0], dim=1)  # c = 6
-        x = self.conv1(x)  # c = 3  |  recover the channels again
+        x = self.sigmoid(self.conv1(x))  # c = 3  |  recover the channels again
         
         return x
 
