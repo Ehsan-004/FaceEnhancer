@@ -1,3 +1,4 @@
+import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 from PIL import Image
@@ -19,14 +20,19 @@ class UFaceDataset(Dataset):
         try:
             img = Image.open(self.paths[index])
             main = self.transform(img)
-            
-            kernel_size = random.choice([3, 5, 7])  
-            sigma = random.uniform(0.1, 2.0)  
+
+            kernel_size = random.choice([5, 7, 9])
+            sigma = random.uniform(0.4, 6.0)
             blured = F.gaussian_blur(main, kernel_size=kernel_size, sigma=sigma)
+
+            # Make noise level random
+            noise_level = random.uniform(0.05, 0.1)
+            noise = torch.randn_like(blured) * noise_level
+            noisy_blured = torch.clamp(blured + noise, 0.0, 1.0)
 
             return {
                 'main': main,
-                'blured': blured
+                'noisy': noisy_blured
             }
 
         except Exception as e:
@@ -36,7 +42,7 @@ class UFaceDataset(Dataset):
 
 if __name__ == "__main__":
     
-    ds = SuperSDataset(
+    ds = UFaceDataset(
         "E:/Projects/RealProjects/MachineLearningPorjects/FaceDetection/temp/backup/img_align_celeba/valid",
         tf.ToTensor(),
         )
