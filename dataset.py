@@ -43,7 +43,7 @@ class UFaceDataset(Dataset):
 if __name__ == "__main__":
     
     ds = UFaceDataset(
-        "E:/Projects/RealProjects/MachineLearningPorjects/FaceDetection/temp/backup/img_align_celeba/valid",
+        "path",
         tf.ToTensor(),
         )
     

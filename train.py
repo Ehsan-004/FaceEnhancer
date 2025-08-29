@@ -25,8 +25,8 @@ def plot_losses(train_losses, val_losses):
 
 
 # paths
-train_path = "E:/Projects/RealProjects/MachineLearningPorjects/FaceDetection/temp/backup/img_align_celeba/train"
-valid_path = "E:/Projects/RealProjects/MachineLearningPorjects/FaceDetection/temp/backup/img_align_celeba/valid"
+train_path = "path"
+valid_path = "path"
 
 # transforms
 transform = tf.Compose([
