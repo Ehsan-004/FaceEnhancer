@@ -16,12 +16,6 @@ main image | noisy image | model's output
 
 <br>
 
-The model has been trained on celebA dataset. It some kind of sucsks on large size images (celebA images' size is (218, 178)).<br>
-If you have access to better GPU and hardware, train the model on a dataset with a higher image quality .
-
-</br>
-
-
 ## 📝 Description
 
 The model receives noisy blured image and tries to decrease the blur and noise and recreate the main image. <br>
